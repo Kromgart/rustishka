@@ -23,75 +23,76 @@ pub enum ProxyError {
 
 pub async fn handle_stream(client_stream: &mut TcpStream) -> Result<(), ProxyError> {
 
+    let mut buf = [0u8; 8*1024];
+    let (mut cl_rx, cl_tx) = client_stream.split();
+    let mut request = parser_wrappers::mk_request_parser(&mut cl_rx, &mut buf);
+    let _n = request.fill().await?;
+    
+    //println!("First fill ({} bytes)", _n);
+    //println!("------- RAW BUFFER START ------------");
+    //println!("{}", request.inner.get_ascii(0, _n));
+    //println!("-------- RAW BUFFER END -------------");
+
+    let (_, met_e) = request.parse_method().await?;
+    request.parse_const(b" http://", TokenType::Protocol).await?;
+    let (dom_s, dom_e) = request.parse_domain().await?;
+    let (path_s, path_e) = request.parse_path().await?;
+
+    // TODO: check if connection allowed
+
+    let domain = unsafe { request.inner.get_ascii(dom_s, dom_e) };
+    let mut server_stream: TcpStream = TcpStream::connect((domain, 80u16)).await.map_err(ProxyError::ServerTcpConnect)?;
+    let (mut srv_rx, srv_tx) = server_stream.split();
+
+    let mut srv_buf = BufWriter::new(srv_tx);
     unsafe {
-        let (mut cl_rx, cl_tx) = client_stream.split();
-        let mut request = parser_wrappers::mk_request_parser(&mut cl_rx);
-        let _n = request.fill().await?;
-        
-        println!("First fill ({} bytes)", _n);
-        println!("------- RAW BUFFER START ------------");
-        println!("{}", request.inner.get_ascii(0, _n));
-        println!("-------- RAW BUFFER END -------------");
-
-        let (_, met_e) = request.parse_method().await?;
-        request.parse_const(b" http://", TokenType::Protocol).await?;
-        let (dom_s, dom_e) = request.parse_domain().await?;
-        let (path_s, path_e) = request.parse_path().await?;
-
-        // if connection allowed, start connecting
-        // let connect_handle = tokio::spawn(...);
-
-        let domain = request.inner.get_ascii(dom_s, dom_e);
-        let mut server_stream: TcpStream = TcpStream::connect((domain, 80u16)).await.map_err(ProxyError::ServerTcpConnect)?;
-        let (mut srv_rx, srv_tx) = server_stream.split();
-
-        let mut srv_buf = BufWriter::new(srv_tx);
         srv_buf.write(request.inner.get(0, met_e + 1)).await.map_err(ProxyError::ServerTcpWrite)?;
         srv_buf.write(request.inner.get(path_s, path_e)).await.map_err(ProxyError::ServerTcpWrite)?;
-        srv_buf.write(b" HTTP/1.0\r\n").await.map_err(ProxyError::ServerTcpWrite)?;
-
-
-        request.parse_const(b" ", TokenType::HTTPVersion).await?;
-        let (ver_maj, ver_min) = request.parse_version_eol().await?;
-
-        println!("Method: '{}'\nDomain: '{}'\nPath: '{}'\nVersion: {}.{}\n", 
-            request.inner.get_ascii(0, met_e),
-            request.inner.get_ascii(dom_s, dom_e),
-            request.inner.get_ascii(path_s, path_e),
-            ver_maj, ver_min);
-
-        if let Some(r_len) = request.process_headers(&mut srv_buf).await? {
-            if r_len > 0 {
-                request.dump_remainder(&mut srv_buf, r_len).await?;
-            }
-        }
-
-        //drop(request);
-
-        srv_buf.flush().await.map_err(ProxyError::ServerTcpWrite)?;
-
-
-        // REQUEST SENT, PROCESSING RESPONSE
-
-
-        let mut cl_buf = BufWriter::new(cl_tx);
-        let mut response = parser_wrappers::mk_response_parser(&mut srv_rx);
-        
-        response.fill().await?;
-        //println!("{}", response.get_ascii(0, response.end));
-
-        let (_, stat_e) = response.parse_resp_status().await?;
-        response.parse_const(b"\r\n", TokenType::StatusLine).await?;
-        cl_buf.write(response.inner.get(0, stat_e + 2)).await.map_err(ProxyError::ClientTcpWrite)?;
-
-        if let Some(r_len) = response.process_headers(&mut cl_buf).await? {
-            if r_len > 0 {
-                response.dump_remainder(&mut cl_buf, r_len).await?;
-            }
-        }
-
-        cl_buf.flush().await.map_err(ProxyError::ClientTcpWrite)?;
     }
+    srv_buf.write(b" HTTP/1.0\r\n").await.map_err(ProxyError::ServerTcpWrite)?;
+
+
+    request.parse_const(b" ", TokenType::HTTPVersion).await?;
+    let (ver_maj, ver_min) = request.parse_version_eol().await?;
+
+    unsafe {
+    println!("Method: '{}'\nDomain: '{}'\nPath: '{}'\nVersion: {}.{}\n", 
+        request.inner.get_ascii(0, met_e),
+        request.inner.get_ascii(dom_s, dom_e),
+        request.inner.get_ascii(path_s, path_e),
+        ver_maj, ver_min);
+    }
+
+    if let Some(r_len) = request.process_headers(&mut srv_buf).await? {
+        if r_len > 0 {
+            request.dump_remainder(&mut srv_buf, r_len).await?;
+        }
+    }
+
+    srv_buf.flush().await.map_err(ProxyError::ServerTcpWrite)?;
+
+
+    // REQUEST SENT, PROCESSING RESPONSE
+
+
+    let mut cl_buf = BufWriter::new(cl_tx);
+    let mut response = parser_wrappers::mk_response_parser(&mut srv_rx, &mut buf);
+    
+    response.fill().await?;
+    //println!("{}", response.get_ascii(0, response.end));
+
+    let (_, stat_e) = response.parse_resp_status().await?;
+    response.parse_const(b"\r\n", TokenType::StatusLine).await?;
+    cl_buf.write(unsafe { response.inner.get(0, stat_e + 2) }).await.map_err(ProxyError::ClientTcpWrite)?;
+
+    if let Some(r_len) = response.process_headers(&mut cl_buf).await? {
+        if r_len > 0 {
+            response.dump_remainder(&mut cl_buf, r_len).await?;
+        }
+    }
+
+    cl_buf.flush().await.map_err(ProxyError::ClientTcpWrite)?;
+
 
     Ok(())
 }
