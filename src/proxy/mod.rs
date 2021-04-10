@@ -23,9 +23,8 @@ pub enum ProxyError {
 
 pub async fn handle_stream(client_stream: &mut TcpStream) -> Result<(), ProxyError> {
 
-    let mut buf = [0u8; 8*1024];
     let (mut cl_rx, cl_tx) = client_stream.split();
-    let mut request = parser_wrappers::mk_request_parser(&mut cl_rx, &mut buf);
+    let mut request = parser_wrappers::mk_request_parser(&mut cl_rx);
     let _n = request.fill().await?;
     
     //println!("First fill ({} bytes)", _n);
@@ -76,7 +75,7 @@ pub async fn handle_stream(client_stream: &mut TcpStream) -> Result<(), ProxyErr
 
 
     let mut cl_buf = BufWriter::new(cl_tx);
-    let mut response = parser_wrappers::mk_response_parser(&mut srv_rx, &mut buf);
+    let mut response = parser_wrappers::mk_response_parser(&mut srv_rx);
     
     response.fill().await?;
     //println!("{}", response.get_ascii(0, response.end));
