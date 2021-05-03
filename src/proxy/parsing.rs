@@ -1,6 +1,6 @@
 use tokio::io::AsyncReadExt;
 
-
+/*
 macro_rules! get_digit_and_next {
     ( $ptr:ident ) => {
         {
@@ -33,7 +33,7 @@ macro_rules! expect_byte_seq {
         $ptr = $ptr.add(1);
     };
 }
-
+*/
 
 macro_rules! mk_parsetoken_fn {
     ($self:ident, $is_token:ident, $token_type:expr) => {{
@@ -80,40 +80,42 @@ pub type ParseResult<T> = Result<T, ParserError>;
 
 #[derive(Debug)]
 pub enum TokenType {
-    Method,
-    Protocol,
+//  Method,
+//  Protocol,
     Domain,
-//  Port,
-    Path,
-    HTTPVersion,
-    HeaderName,
-    HeaderValue,
-    HeadEnd,
-    StatusLine,
+    Port,
+//  Path,
+//  HTTPVersion,
+//  HeaderName,
+//  HeaderValue,
+//  HeadEnd,
+//  StatusLine,
 }
 
 
-pub struct BufferedParser<'reader, S, const BUF_SIZE: usize> {
-    buf: [u8; BUF_SIZE],
+pub struct BufferedParser<'reader, 'buffer, S, const BUF_SIZE: usize> {
+    buf: &'buffer mut [u8; BUF_SIZE],
     stream: &'reader mut S,
     pos: usize,
     end: usize,
 }
 
 
-impl<'reader, S: AsyncReadExt + Unpin, const BUF_SIZE: usize> BufferedParser<'reader, S, BUF_SIZE> {
+impl<'reader, 'buffer, S: AsyncReadExt + Unpin, const BUF_SIZE: usize> BufferedParser<'reader, 'buffer, S, BUF_SIZE> {
 
-    pub fn new(stream: &'reader mut S) -> BufferedParser<'reader, S, BUF_SIZE> {
+    pub fn new(stream: &'reader mut S, buf: &'buffer mut [u8; BUF_SIZE]) -> BufferedParser<'reader, 'buffer, S, BUF_SIZE> {
         BufferedParser {
+            buf,
             stream,
-            buf: [0u8; BUF_SIZE],
             pos: 0usize,
             end: 0usize,
         }
     }
 
+
     #[inline]
-    pub unsafe fn get(&self, start: usize, end: usize) -> &[u8]  {
+    pub unsafe fn get(&self, start: usize, end: usize) -> &[u8] 
+    {
         debug_assert!(start < end);
         debug_assert!(end <= self.end);
         self.buf.get_unchecked(start .. end)
@@ -123,7 +125,7 @@ impl<'reader, S: AsyncReadExt + Unpin, const BUF_SIZE: usize> BufferedParser<'re
     pub unsafe fn get_ascii(&self, start: usize, end: usize) -> &str {
         std::str::from_utf8_unchecked(self.get(start, end))
     }
-
+/*
     #[inline]
     pub fn get_remainder(&self) -> &[u8] {
         debug_assert!(self.pos < self.end);
@@ -135,6 +137,33 @@ impl<'reader, S: AsyncReadExt + Unpin, const BUF_SIZE: usize> BufferedParser<'re
         self.pos = 0;
         self.end = 0;
         unsafe { ( self.stream, self.buf.get_unchecked_mut(0 .. BUF_SIZE) ) }
+    }
+*/
+    pub async fn skip_n(&mut self, n: usize) -> ParseResult<()> {
+        while self.pos + n > self.end {
+            let _ = self.fill().await?;
+        }
+
+        self.pos += n;
+        Ok(())
+    }
+
+    pub async fn skip_until_endswith<const LEN: usize>(&mut self, con: &[u8; LEN]) -> ParseResult<()> {
+        'outer: loop {
+            if self.pos + LEN > self.end {
+                let _ = self.fill().await?;
+                continue;
+            }
+
+            let t = self.end - LEN;
+            for i in 0 .. LEN {
+                if con[i] != unsafe { *self.buf.get_unchecked(t + i) } {
+                    self.fill().await?;
+                    continue 'outer;
+                } 
+            }
+            return Ok(());
+        }
     }
 
     pub async fn fill(&mut self) -> ParseResult<usize> {
@@ -156,15 +185,19 @@ impl<'reader, S: AsyncReadExt + Unpin, const BUF_SIZE: usize> BufferedParser<'re
             Err(e) => Err(ParserError::TcpRead(e)),
         }
     }
-
+/*
     pub async fn parse_method(&mut self) -> ParseResult<(usize, usize)> {
         mk_parsetoken_fn!(self, is_uppercase, TokenType::Method);
     }
-
+*/
     pub async fn parse_domain(&mut self) -> ParseResult<(usize, usize)> {
         mk_parsetoken_fn!(self, is_domain, TokenType::Domain);
     }
 
+    pub async fn parse_port(&mut self) -> ParseResult<(usize, usize)> {
+        mk_parsetoken_fn!(self, is_integer, TokenType::Port);
+    }
+/*
     pub async fn parse_path(&mut self) -> ParseResult<(usize, usize)> {
         mk_parsetoken_fn!(self, is_path, TokenType::Path);
     }
@@ -180,54 +213,53 @@ impl<'reader, S: AsyncReadExt + Unpin, const BUF_SIZE: usize> BufferedParser<'re
     pub async fn parse_header_value(&mut self) -> ParseResult<(usize, usize)> {
         mk_parsetoken_fn!(self, is_headervalue, TokenType::HeaderValue);
     }
-
+*/
     pub async fn parse_const<const LEN: usize>(
         &mut self, 
-        con: &'static [u8; LEN], 
+        con: &[u8; LEN], 
         token_type: TokenType) -> ParseResult<()> 
     {
-        unsafe {
         while LEN > self.end - self.pos {
             let _n = self.fill().await?;
         }
 
-        let data = self.buf.get_unchecked(self.pos .. self.pos + LEN);
+        unsafe {
+            let data = self.buf.get_unchecked(self.pos .. self.pos + LEN);
 
-        for i in 0 .. LEN {
-            let c = *data.get_unchecked(i); 
-            if con[i] != c {
-                return Err(ParserError::InvalidByte(c, token_type));
+            for i in 0 .. LEN {
+                let c = *data.get_unchecked(i); 
+                if con[i] != c {
+                    return Err(ParserError::InvalidByte(c, token_type));
+                }
             }
         }
 
         self.pos += LEN;
-        }
         Ok(())
     }
 
-
+/*
     pub async fn parse_version_eol(&mut self) -> ParseResult<(u8, u8)> {
         // ensure that enough bytes were fetched:
         const LEN: usize = b"HTTP/1.1\r\n".len();
-
-        unsafe {
         while LEN > self.end - self.pos {
             let _n = self.fill().await?;
         }
 
-        let mut p: *const u8 = self.buf.get_unchecked(self.pos);
-        expect_byte_seq!(p, TokenType::HTTPVersion, b'H', b'T', b'T', b'P', b'/');
-        let maj = get_digit_and_next!(p);
-        expect_byte_seq!(p, TokenType::HTTPVersion, b'.');
-        let min = get_digit_and_next!(p);
-        expect_byte_seq!(p, TokenType::HTTPVersion, b'\r');
-        expect_byte!(p, TokenType::HTTPVersion, b'\n');
+        unsafe {
+            let mut p: *const u8 = self.buf.get_unchecked(self.pos);
+            expect_byte_seq!(p, TokenType::HTTPVersion, b'H', b'T', b'T', b'P', b'/');
+            let maj = get_digit_and_next!(p);
+            expect_byte_seq!(p, TokenType::HTTPVersion, b'.');
+            let min = get_digit_and_next!(p);
+            expect_byte_seq!(p, TokenType::HTTPVersion, b'\r');
+            expect_byte!(p, TokenType::HTTPVersion, b'\n');
 
-        self.pos += LEN;
-        Ok((maj, min))
+            self.pos += LEN;
+            Ok((maj, min))
         }
     }
-
+*/
 }
 
 
@@ -235,8 +267,12 @@ impl<'reader, S: AsyncReadExt + Unpin, const BUF_SIZE: usize> BufferedParser<'re
 
 
 
+#[inline]
+fn is_integer(c: u8) -> bool {
+    c >= b'0' && c <= b'9'
+}
 
-
+/*
 #[inline]
 fn is_uppercase(c: u8) -> bool {
     c >= b'A' && c <= b'Z'
@@ -253,7 +289,7 @@ macro_rules! make_map_256 {
         $($flag != 0,)+
     ])
 }
-
+*/
 
 macro_rules! make_map_128 {
     ($($flag:expr,)+) => ([
@@ -293,7 +329,7 @@ fn is_domain(b: u8) -> bool {
     unsafe { *DOMAIN_MAP.get_unchecked(b as usize) }
 }
 
-
+/*
 static PATH_MAP: [bool; 256] = make_map_128![
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
@@ -360,7 +396,7 @@ static HEADER_VALUE_MAP: [bool; 256] = make_map_256![
 fn is_headervalue(b: u8) -> bool {
     unsafe { *HEADER_VALUE_MAP.get_unchecked(b as usize) }
 }
-
+*/
 
 
 fn match_while<F: Fn(u8) -> bool>(buf: &[u8], is_token: F) -> (usize, Option<u8>) {
