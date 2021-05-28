@@ -1,62 +1,72 @@
+use std::io::Error as IOErr;
+//use std::sync::Arc;
+
 use tokio::net::TcpStream;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::task::JoinError;
 
+use tokio_rustls::webpki::{DNSName, DNSNameRef};
 
 mod parsing;
 
 
 #[derive(Debug)]
 pub enum ProxyError {
-    ClientTcpRead(std::io::Error),
-    ClientTcpWrite(std::io::Error),
+    ClientTcpEOF,
+    ClientTcpRead(IOErr),
+    ClientTcpWrite(IOErr),
 
     Hyper(hyper::Error),
     Parse(parsing::ParserError),
 
-    //ServerTcpRead(std::io::Error),
-    //ServerTcpWrite(std::io::Error),
+    //ServerTcpEOF,
+    ServerTcpRead(IOErr),
+    //ServerTcpWrite(IOErr),
 
-    ServerTcpConnect(std::io::Error),
-    TcpUpstream(std::io::Error),
-    TcpDownstream(std::io::Error),
+    ServerTcpConnect(IOErr),
+    TcpTunnelUpstream(Result<IOErr, JoinError>),
+    TcpTunnelDownstream(Result<IOErr, JoinError>),
+
+    TlsDns(tokio_rustls::webpki::InvalidDNSNameError),
+    TlsConnector(IOErr),
+    TlsMissingCerts,
 }
 
 
-pub type ProxyResult = Result<(), ProxyError>;
+pub type ProxyResult<T> = Result<T, ProxyError>;
 
 const PEEK_TEST: &[u8] = b"CONNECT ";
 const PEEK_LEN: usize = PEEK_TEST.len();
 
-pub async fn handle_stream(mut cl_stream: TcpStream) -> ProxyResult {
-    {
-        let mut peek_buf = [0u8; PEEK_LEN];
+pub async fn handle_stream(mut cl_stream: TcpStream, cfg: crate::Config) -> ProxyResult<()> {
 
-        let rd = cl_stream.peek(peek_buf.as_mut()).await.map_err(ProxyError::ClientTcpRead)?;
-        if rd < PEEK_LEN {
-            if rd > 0 {
-                println!("Proxy: First read too small");
-                cl_stream
-                    .write(
-                    b"HTTP/1.1 500 Internal Server Error\r\n\
-                    Content-Length: 27\r\n\
-                    Connection: close\r\n\r\n\
-                    Proxy: First read too small")
-                    .await.map_err(ProxyError::ClientTcpWrite)?;
-            } else {
-                println!("Proxy: client sent EOF (0-length 'read')");
-            }
+    let mut peek_buf = [0u8; PEEK_LEN];
 
-            return Ok(());
-        } else if peek_buf.as_ref() == PEEK_TEST {
-            return handle_connect_verb::<PEEK_LEN>(cl_stream).await;
+    let rd = cl_stream.peek(peek_buf.as_mut()).await.map_err(ProxyError::ClientTcpRead)?;
+    if rd < PEEK_LEN {
+        if rd > 0 {
+            println!("Proxy: First read too small");
+            cl_stream
+                .write(
+                b"HTTP/1.1 500 Internal Server Error\r\n\
+                Content-Length: 27\r\n\
+                Connection: close\r\n\r\n\
+                Proxy: First read too small")
+                .await.map_err(ProxyError::ClientTcpWrite)?;
+        } else {
+            println!("Proxy: client sent EOF (0-length 'read')");
         }
+
+        return Ok(());
+    } else if peek_buf.as_ref() == PEEK_TEST {
+        return handle_connect_verb::<PEEK_LEN>(cl_stream, &cfg).await;
     }
 
     handle_plain_http(cl_stream).await
 }
 
 
-async fn handle_plain_http<IO>(cl_stream: IO) -> ProxyResult
+async fn handle_plain_http<IO>(cl_stream: IO) -> ProxyResult<()>
     where IO: AsyncReadExt + AsyncWriteExt + Unpin + 'static
 {
     /*
@@ -112,67 +122,143 @@ async fn handle_plain_http<IO>(cl_stream: IO) -> ProxyResult
     h.await.map_err(ProxyError::Hyper)
 }
 
+use der_parser::oid;
+static SAN_OID: oid::Oid<'static>  = oid!(2.5.29.17);
 
-async fn handle_connect_verb<const SKIP: usize>(mut cl_stream: TcpStream) -> ProxyResult {
+async fn handle_connect_verb<const SKIP: usize>(mut cl_stream: TcpStream, cfg: &crate::Config) -> ProxyResult<()> {
 
-    let srv_stream = {
-        let mut buf = [0u8; 8 * 1024];
-        let mut parser = parsing::BufferedParser::new(&mut cl_stream, &mut buf);
-        let _ = parser.skip_n(SKIP).await.map_err(ProxyError::Parse)?;
-        let (dom_1, dom_2) = parser.parse_domain().await.map_err(ProxyError::Parse)?;
-        let _ = parser.parse_const(b":", parsing::TokenType::Port).await.map_err(ProxyError::Parse)?;
-        let (port_1, port_2) = parser.parse_port().await.map_err(ProxyError::Parse)?;
-        let _ = parser.skip_until_endswith(b"\r\n\r\n").await.map_err(ProxyError::Parse)?;
+    let (srv_stream, dns) = get_srv_stream::<SKIP>(&mut cl_stream).await?;
 
-        let domain = unsafe { parser.get_ascii(dom_1, dom_2) };
-        let port: u16 = unsafe { atoi::atoi(parser.get(port_1, port_2)).expect("Cannot parse CONNECT port") };
-    
-        println!("Proxy: CONNECT to {}:{}", domain, port);
+    match dns {
+        None => {
+            // Transparent TCP tunnel
 
-        TcpStream::connect((domain, port)).await.map_err(ProxyError::ServerTcpConnect)?
-    };
+            let (srv_rx, srv_tx) = srv_stream.into_split();
+            let (cl_rx, cl_tx) = cl_stream.into_split();
+
+            let mut upstream = tokio::spawn(stream_data(cl_rx, srv_tx));
+            let mut downstream = tokio::spawn(stream_data(srv_rx, cl_tx));
+
+            let res: ProxyResult<()> = tokio::select! {
+                r = &mut upstream => { 
+                    (&mut downstream).abort();
+                    mk_res(r, ProxyError::TcpTunnelUpstream)
+                }
+                r = &mut downstream => { 
+                    (&mut upstream).abort();
+                    mk_res(r, ProxyError::TcpTunnelDownstream)
+                }
+            };
+
+            //println!("TCP tunnel closed");
+            res
+        },
+        Some(name) => {
+            // Unwrap TLS
+            use rustls::Session;
+            let srv_stream = cfg.tls_connector.connect(name.as_ref(), srv_stream).await.map_err(ProxyError::TlsConnector)?;
+            let (_, cl_ses) = srv_stream.get_ref();
+            match cl_ses.get_peer_certificates() {
+                Some(certs) => {
+                    print!("Connected. Read certificate ...");
+
+                    if let Some(cert) = certs.get(0) {
+                        use x509_parser::nom::Finish;
+                        if let Ok((_, cr)) = x509_parser::parse_x509_certificate(cert.as_ref()).finish() {
+                            if let Some(v) = cr.extensions().get(&SAN_OID) {
+                                use x509_parser::extensions::{ParsedExtension, SubjectAlternativeName};
+                                if let ParsedExtension::SubjectAlternativeName(SubjectAlternativeName { general_names: dnames }) = v.parsed_extension() { 
+                                    println!(" SAN => {:?}", dnames);
+                                }
+                            }
+                        }
+                    }
+
+                    Ok(())
+                },
+                None => Err(ProxyError::TlsMissingCerts)
+            }
+        }
+    }
+}
+
+
+async fn stream_data(mut rx: tokio::net::tcp::OwnedReadHalf, mut tx: tokio::net::tcp::OwnedWriteHalf) -> Result<(), IOErr> {
+    let mut buf = [0u8; 8 * 1024];
+    loop {
+        let n = rx.read(&mut buf).await?;
+        if 0 != n {
+            tx.write_all(unsafe { buf.get_unchecked(0 .. n)}).await?;
+            //println!("tranferred bytes: {}", n);
+        } else {
+            return Ok(());
+        }
+    }
+}
+
+
+#[inline]
+fn mk_res<F>(r: Result<Result<(), IOErr>, JoinError>, maperr: F) -> ProxyResult<()>
+where F: Fn(Result<IOErr, JoinError>) -> ProxyError
+{
+    match r {
+        Ok(r2) => {
+            match r2 {
+                Ok(()) => Ok(()),
+                Err(e) => Err(maperr(Ok(e))),
+            }
+        },
+        Err(join_err) => Err(maperr(Err(join_err)))
+    }
+}
+
+
+async fn get_srv_stream<const SKIP: usize>(cl_stream: &mut TcpStream) -> ProxyResult<(TcpStream, Option<DNSName>)> {
+    let mut buf = [0u8; 1024];
+    let mut parser = parsing::BufferedParser::new(cl_stream, &mut buf);
+
+    let _ = parser.skip_n(SKIP).await.map_err(ProxyError::Parse)?;
+    let (dom_1, dom_2) = parser.parse_domain().await.map_err(ProxyError::Parse)?;
+    let _ = parser.parse_const(b":", parsing::TokenType::Port).await.map_err(ProxyError::Parse)?;
+    let (port_1, port_2) = parser.parse_port().await.map_err(ProxyError::Parse)?;
+    let _ = parser.skip_until_endswith(b"\r\n\r\n").await.map_err(ProxyError::Parse)?;
+
+    drop(parser);
+
+    let domain = unsafe { std::str::from_utf8_unchecked(buf.get_unchecked(dom_1 .. dom_2)) };
+    let port: u16 = unsafe { atoi::atoi(buf.get_unchecked(port_1 .. port_2)).expect("Cannot parse CONNECT port") };
+
+    // TODO: check blocked domains
+    // ...
+
+    let srv_stream = TcpStream::connect((domain, port)).await.map_err(ProxyError::ServerTcpConnect)?;
 
     cl_stream.write_all(b"HTTP/1.1 200 OK\r\n\r\n").await.map_err(ProxyError::ClientTcpWrite)?;
-
-    let (mut srv_rx, mut srv_tx) = srv_stream.into_split();
-    let (mut cl_rx, mut cl_tx) = cl_stream.into_split();
-
-    let mut upstream = tokio::spawn(async move {
-        let mut buf = [0u8; 8 * 1024];
-        loop {
-            if let 0 = send_data(&mut cl_rx, &mut srv_tx, &mut buf).await.map_err(ProxyError::TcpUpstream)? {
-                return Ok::<usize, ProxyError>(0);
-            }
-        }
-    });
-
-    let mut downstream = tokio::spawn(async move {
-        let mut buf = [0u8; 8 * 1024];
-        loop {
-            if let 0 = send_data(&mut srv_rx, &mut cl_tx, &mut buf).await.map_err(ProxyError::TcpDownstream)? {
-                return Ok::<usize, ProxyError>(0);
-            }
-        }
-    });
-
-    //println!("Proxy: futures ready");
-
-    tokio::select! {
-        _ = &mut upstream => { (&mut downstream).abort() }
-        _ = &mut downstream => { (&mut upstream).abort() }
-    };
     
-    println!("Proxy: tunnel ends");
-    return Ok(());
-}
+    let bypass = {
+        // TODO: check bypass domains
+        if domain == "docs.rs" {
+            true
+        } else {
+            let mut tls_rec_type = 0u8;
+            let rd = cl_stream.peek(std::slice::from_mut(&mut tls_rec_type)).await.map_err(ProxyError::ServerTcpRead)?;
+            if rd == 0 {
+                return Err(ProxyError::ClientTcpEOF);
+            }
 
+            tls_rec_type != 22u8 // is not TLS handshake ?
+        }
+    };
 
-async fn send_data(rx: &mut tokio::net::tcp::OwnedReadHalf, tx: &mut tokio::net::tcp::OwnedWriteHalf, buf: &mut[u8]) -> Result<usize, std::io::Error> {
-    let n = rx.read(buf).await?;
-    if n != 0 {
-        tx.write_all(unsafe { buf.get_unchecked(0 .. n)}).await?;
-        println!("tranferred bytes: {}", n);
+    if bypass {
+        println!("Client -> Raw CONNECT to {}:{}", domain, port);
+        Ok((srv_stream, None))
+    } else {
+        println!("Client -> TLS CONNECT to {}:{}", domain, port);
+        match DNSNameRef::try_from_ascii_str(domain) {
+            Ok(dnsref) => Ok((srv_stream, Some(dnsref.to_owned()))),
+            Err(e) => Err(ProxyError::TlsDns(e))
+        }
     }
-
-    Ok(n)
 }
+

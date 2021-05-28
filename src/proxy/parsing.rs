@@ -112,7 +112,7 @@ impl<'reader, 'buffer, S: AsyncReadExt + Unpin, const BUF_SIZE: usize> BufferedP
         }
     }
 
-
+/*
     #[inline]
     pub unsafe fn get(&self, start: usize, end: usize) -> &[u8] 
     {
@@ -125,7 +125,7 @@ impl<'reader, 'buffer, S: AsyncReadExt + Unpin, const BUF_SIZE: usize> BufferedP
     pub unsafe fn get_ascii(&self, start: usize, end: usize) -> &str {
         std::str::from_utf8_unchecked(self.get(start, end))
     }
-/*
+
     #[inline]
     pub fn get_remainder(&self) -> &[u8] {
         debug_assert!(self.pos < self.end);

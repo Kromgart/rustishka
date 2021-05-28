@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
@@ -20,10 +21,11 @@ enum TaskMsg {
     AbortAll,
 }
 
-#[derive(Debug, Clone)]
-struct Config {
+#[derive(Clone)]
+pub struct Config {
     control_socket: String,
     proxy_socket: String,
+    tls_connector: tokio_rustls::TlsConnector,
 }
 
 
@@ -33,16 +35,24 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
     loop {
         println!("Server starting...");
 
+        // TODO: setup configuration
         let cfg_ctl = Config {
             control_socket: String::from("127.0.0.1:8081"),
             proxy_socket: String::from("127.0.0.1:8080"),
+            tls_connector: {
+                let mut tls_cfg = rustls::ClientConfig::new();
+                let alpn = Vec::<u8>::from(&(b"http/1.1"[..]));
+                tls_cfg.set_protocols(&[alpn]);
+                tls_cfg.root_store.add_server_trust_anchors(&webpki_roots::TLS_SERVER_ROOTS);
+
+                Arc::new(tls_cfg).into()
+            },
         };
 
         let cfg = cfg_ctl.clone();
 
         let (tx, rx) = mpsc::channel::<ControlMsg>(1);
         
-
         let srv_control = tokio::spawn(serve_control(cfg_ctl, tx));
         let srv_proxy = serve_proxy(cfg, rx);
 
@@ -80,7 +90,7 @@ async fn serve_control(cfg: Config, tx: mpsc::Sender<ControlMsg>) -> Result<bool
 
 async fn serve_proxy(cfg: Config, mut rx: mpsc::Receiver<ControlMsg>) -> Result<(), Box<dyn std::error::Error>> {
     println!("Proxy socket is {}", cfg.proxy_socket);
-    let proxy_lsn = TcpListener::bind(cfg.proxy_socket).await.expect("Proxy: cannot bind to socket");
+    let proxy_lsn = TcpListener::bind(&cfg.proxy_socket).await.expect("Proxy: cannot bind to socket");
 
     let (tx_task, rx_task) = mpsc::channel::<TaskMsg>(32);
     let task_watcher = tokio::spawn(watch_tasks(rx_task));
@@ -90,11 +100,12 @@ async fn serve_proxy(cfg: Config, mut rx: mpsc::Receiver<ControlMsg>) -> Result<
             con = proxy_lsn.accept() => {
                 match con {
                     Ok((stream, addr)) => {
+                        let cfg = cfg.clone();
                         let ttx = tx_task.clone();
                         let task = tokio::spawn(async move {
                             println!("Incoming connection from {}", addr);
 
-                            if let Err(e) = proxy::handle_stream(stream).await {
+                            if let Err(e) = proxy::handle_stream(stream, cfg).await {
                                 println!("Error: {:?}", e);
                             }
 
@@ -133,25 +144,21 @@ async fn watch_tasks(mut rx: mpsc::Receiver<TaskMsg>) {
     let mut tasks: HashMap<SocketAddr, JoinHandle<()>> = HashMap::with_capacity(64);
     let mut pre_deleted: HashSet<SocketAddr> = HashSet::with_capacity(8);
 
-    loop {
-        if let Some(msg) = rx.recv().await {
-            match msg {
-                TaskMsg::Add(s, h) => {
-                    if !pre_deleted.remove(&s) {
-                        tasks.insert(s, h);
-                    }
-                },
-                TaskMsg::Remove(s) => {
-                    if tasks.remove(&s).is_none() {
-                        pre_deleted.insert(s);
-                    }
-                },
-                TaskMsg::AbortAll => {
-                    break;
+    while let Some(msg) = rx.recv().await {
+        match msg {
+            TaskMsg::Add(s, h) => {
+                if !pre_deleted.remove(&s) {
+                    tasks.insert(s, h);
                 }
-            };
-        } else {
-            break;
+            },
+            TaskMsg::Remove(s) => {
+                if tasks.remove(&s).is_none() {
+                    pre_deleted.insert(s);
+                }
+            },
+            TaskMsg::AbortAll => {
+                break;
+            }
         }
     }
 
