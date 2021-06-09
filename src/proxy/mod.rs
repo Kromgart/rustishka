@@ -123,7 +123,7 @@ async fn handle_plain_http<IO>(cl_stream: IO) -> ProxyResult<()>
 }
 
 use der_parser::oid;
-static SAN_OID: oid::Oid<'static>  = oid!(2.5.29.17);
+static X509_SAN_OID: oid::Oid<'static>  = oid!(2.5.29.17);
 
 async fn handle_connect_verb<const SKIP: usize>(mut cl_stream: TcpStream, cfg: &crate::Config) -> ProxyResult<()> {
 
@@ -157,28 +157,57 @@ async fn handle_connect_verb<const SKIP: usize>(mut cl_stream: TcpStream, cfg: &
             // Unwrap TLS
             use rustls::Session;
             let srv_stream = cfg.tls_connector.connect(name.as_ref(), srv_stream).await.map_err(ProxyError::TlsConnector)?;
-            let (_, cl_ses) = srv_stream.get_ref();
-            match cl_ses.get_peer_certificates() {
-                Some(certs) => {
-                    print!("Connected. Read certificate ...");
 
-                    if let Some(cert) = certs.get(0) {
-                        use x509_parser::nom::Finish;
-                        if let Ok((_, cr)) = x509_parser::parse_x509_certificate(cert.as_ref()).finish() {
-                            if let Some(v) = cr.extensions().get(&SAN_OID) {
-                                use x509_parser::extensions::{ParsedExtension, SubjectAlternativeName};
-                                if let ParsedExtension::SubjectAlternativeName(SubjectAlternativeName { general_names: dnames }) = v.parsed_extension() { 
-                                    println!(" SAN => {:?}", dnames);
-                                }
-                            }
-                        }
-                    }
+            // TODO: move this to TLS handshake (get cert according to client's TLS SNI)
+            let mitm_cert = make_mitm_cert(&srv_stream, &cfg.ca_cert);
 
-                    Ok(())
-                },
-                None => Err(ProxyError::TlsMissingCerts)
+            Ok(())
+        }
+    }
+}
+
+
+#[derive(Debug)]
+pub enum MitmGenError {
+    ServerNoCert,
+    ServerCertParse(x509_parser::error::X509Error),
+    ServerNoSanExt,
+    ServerSanExtParse,
+    ServerSanExtNonDNSName(String),
+
+    CertGen(rcgen::RcgenError),
+}
+
+
+fn make_mitm_cert(srv_stream: &tokio_rustls::client::TlsStream<TcpStream>, ca_cert: &rcgen::Certificate) -> Result<(Vec<String>, Vec<u8>), MitmGenError> {
+    use rustls::Session;
+    use x509_parser::nom::Finish;
+    use x509_parser::extensions::{ ParsedExtension, SubjectAlternativeName, GeneralName };
+
+    let (_, cl_ses) = srv_stream.get_ref();
+    let certs = cl_ses.get_peer_certificates().ok_or(MitmGenError::ServerNoCert)?;
+    let cert = certs.get(0).ok_or(MitmGenError::ServerNoCert)?;
+    let (_, cr) = x509_parser::parse_x509_certificate(cert.as_ref()).finish().map_err(MitmGenError::ServerCertParse)?; 
+    let v = cr.extensions().get(&X509_SAN_OID).ok_or(MitmGenError::ServerNoSanExt)?;
+
+    if let ParsedExtension::SubjectAlternativeName(SubjectAlternativeName { general_names: gnames }) = v.parsed_extension() { 
+
+        let mut dnames_str = Vec::<String>::with_capacity(gnames.len());
+        for gen_name in gnames {
+            match gen_name {
+                GeneralName::DNSName(dns_str) => dnames_str.push(String::from(*dns_str)),
+                _ => return Err(MitmGenError::ServerSanExtNonDNSName(String::from(format!("{:?}", gen_name))))
             }
         }
+
+        let cert_param = rcgen::CertificateParams::new(dnames_str.clone());
+        let cert = rcgen::Certificate::from_params(cert_param).map_err(MitmGenError::CertGen)?;
+
+        let cert_der = cert.serialize_der_with_signer(ca_cert).map_err(MitmGenError::CertGen)?;
+
+        Ok((dnames_str, cert_der))
+    } else {
+        Err(MitmGenError::ServerSanExtParse)
     }
 }
 

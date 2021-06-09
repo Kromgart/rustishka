@@ -5,6 +5,7 @@ use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
+use rcgen::{Certificate, CertificateParams};
 
 mod proxy;
 
@@ -26,11 +27,23 @@ pub struct Config {
     control_socket: String,
     proxy_socket: String,
     tls_connector: tokio_rustls::TlsConnector,
+    ca_cert: Arc<Certificate>,
 }
 
 
 #[tokio::main]
 pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
+
+
+    let ccrt = { 
+        use std::fs::read_to_string;
+        let ca_cert_pem = read_to_string("/home/kromgart/certs/ca_cert.pem").expect("Cannot read CA cert");
+        let ca_keys_pem = read_to_string("/home/kromgart/certs/ca_key.pem").expect("Cannot read CA key");
+
+        let ca_keys = rcgen::KeyPair::from_pem(&ca_keys_pem).expect("Cannot parse CA key");
+        let cert_params = CertificateParams::from_ca_cert_pem(&ca_cert_pem, ca_keys).unwrap();
+        Arc::new(Certificate::from_params(cert_params).unwrap())
+    };
 
     loop {
         println!("Server starting...");
@@ -47,6 +60,7 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 Arc::new(tls_cfg).into()
             },
+            ca_cert: ccrt.clone(),
         };
 
         let cfg = cfg_ctl.clone();
